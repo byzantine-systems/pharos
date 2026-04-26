@@ -1,0 +1,29 @@
+name = "pharos"
+version = "1.0.0"
+
+description = "A 'plugin-based' monitor and alert manager for BEAM Nodes and Hosts"
+licences = ["GPL-3.0"]
+repository = { type = "github", user = "byzantine-systems", repo = "pharos" }
+# links = [{ title = "Website", href = "" }]
+#
+# For a full reference of all the available options, you can have a look at
+# https://gleam.run/writing-gleam/gleam-toml/.
+
+[dependencies]
+gleam_stdlib = ">= 0.44.0 and < 2.0.0"
+gleam_erlang = ">= 0.25.0 and < 2.0.0"
+logging = ">= 1.0.0 and < 2.0.0"
+telemetry = ">= 1.0.0 and < 2.0.0"
+telemetry_poller = ">= 1.0.0 and < 2.0.0"
+eparch = ">= 1.0.0 and < 2.0.0"
+gleam_otp = ">= 1.0.0 and < 2.0.0"
+
+[dev_dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"
+
+[documentation]
+pages = [
+    { title = "Examples", path = "examples/readme.html", source = "./examples/README.md" },
+    { title = "Quick Start", path = "docs/quick_start.html", source = "./docs/Quick_Start.md" },
+    { title = " ", path = "#", source = "" },
+]

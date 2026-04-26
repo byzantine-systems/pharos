@@ -1,0 +1,245 @@
+//// Per-threshold alert state machine.
+////
+//// Wraps an `eparch/state_machine` running the four-state lifecycle
+////  `Clear -> Pending -> Firing -> Cooling -> Clear`. 
+//// The state machine is registered under a deterministic `Name` so 
+//// that supervisor restarts.
+//// keep `AlertManager` handles valid: callers send `Breach` / `Recover`
+//// casts to the registered name, which the OTP runtime resolves to the
+//// current pid on each call.
+////
+//// `breach/1` and `recover/1` map physical signals (threshold crossed
+//// up / down) to state transitions. The dispatcher is notified with
+//// `AlertFiring` and `AlertResolved` events on the relevant transitions.
+
+import eparch/state_machine.{type StartError}
+import gleam/erlang/process.{type Name}
+import gleam/option.{type Option, None, Some}
+import pharos/alert.{
+  type AlertData, type AlertLevel, type AlertState, type WindowSpec, AlertData,
+  AlertFiring, AlertResolved, Clear, Cooling, Firing, Pending,
+}
+import pharos/event_bus.{type EventBus}
+import pharos/internal/clock
+
+/// Restart-resilient handle to a per-threshold alert state machine.
+pub opaque type AlertManager {
+  AlertManager(name: Name(Message))
+}
+
+/// Internal command messages.
+pub type Message {
+  Breach
+  Recover
+  /// A windowed-rule sample. The manager appends it to its bounded window and
+  /// derives a breach/recover decision from the aggregate.
+  Sample(value: Float)
+}
+
+/// Internal data carried across state transitions.
+type Data {
+  Data(
+    id: String,
+    level: AlertLevel,
+    soak_milliseconds: Int,
+    cool_milliseconds: Int,
+    bus: EventBus,
+    /// Sliding-window spec for windowed rules; `None` for per-tick rules.
+    window: Option(WindowSpec),
+    /// Recent `#(timestamp_ms, value)` samples, pruned to the window duration.
+    samples: List(#(Int, Float)),
+  )
+}
+
+/// Wrap a registered name as an `AlertManager`. The supervisor uses this
+/// to build handles before the underlying state machine has been started,
+/// so that the handler-attacher can route breach/recover signals to a
+/// stable address.
+pub fn from_name(name: Name(Message)) -> AlertManager {
+  AlertManager(name: name)
+}
+
+/// Start a state machine for `data`, registering it under `name`. Notifies
+/// `bus` with `AlertFiring` / `AlertResolved` events on the relevant
+/// transitions.
+pub fn start_link(
+  data: AlertData,
+  bus: EventBus,
+  name: Name(Message),
+) -> Result(AlertManager, StartError) {
+  let AlertData(id:, level:, soak_period_ms:, cool_period_ms:, window:) = data
+  let initial =
+    Data(
+      id: id,
+      level: level,
+      soak_milliseconds: soak_period_ms,
+      cool_milliseconds: cool_period_ms,
+      bus: bus,
+      window: window,
+      samples: [],
+    )
+
+  let result =
+    state_machine.new(initial_state: Clear, initial_data: initial)
+    |> state_machine.named(state_machine.Local(name))
+    |> state_machine.on_event(handle_event)
+    |> state_machine.start_link
+
+  case result {
+    Ok(_started) -> Ok(AlertManager(name: name))
+    Error(error) -> Error(error)
+  }
+}
+
+/// Signal that the threshold has been breached.
+pub fn breach(manager: AlertManager) -> Nil {
+  state_machine.cast(server_ref(manager), Breach)
+}
+
+/// Signal that the threshold is no longer breached.
+pub fn recover(manager: AlertManager) -> Nil {
+  state_machine.cast(server_ref(manager), Recover)
+}
+
+/// Feed a sample to a windowed rule. The manager folds it into its window and
+/// derives breach/recover from the aggregate.
+pub fn sample(manager: AlertManager, value: Float) -> Nil {
+  state_machine.cast(server_ref(manager), Sample(value))
+}
+
+/// Resolve a manager's registered name to a `ServerRef` for casting.
+fn server_ref(manager: AlertManager) -> state_machine.ServerRef(Message) {
+  state_machine.ref_from_subject(process.named_subject(manager.name))
+}
+
+fn handle_event(
+  event: state_machine.Event(AlertState, Message, reply),
+  state: AlertState,
+  data: Data,
+) -> state_machine.Step(AlertState, Data, Message, reply) {
+  case event {
+    state_machine.Cast(Breach) -> handle_breach(state, data)
+    state_machine.Cast(Recover) -> handle_recover(state, data)
+    state_machine.Cast(Sample(value)) -> handle_sample(state, data, value)
+    state_machine.Timeout(state_machine.StateTimeoutType, _) ->
+      handle_state_timeout(state, data)
+    // We only ever arm state timeouts; the other timer classes are listed
+    // explicitly so a new `TimeoutType` variant surfaces here as a warning.
+    state_machine.Timeout(state_machine.EventTimeoutType, _) ->
+      state_machine.keep_state(data, [])
+    state_machine.Timeout(state_machine.GenericTimeoutType(_), _) ->
+      state_machine.keep_state(data, [])
+    state_machine.Info(_) -> state_machine.keep_state(data, [])
+    state_machine.Call(_, _) -> state_machine.keep_state(data, [])
+    state_machine.Enter(_) -> state_machine.keep_state(data, [])
+  }
+}
+
+fn handle_breach(
+  state: AlertState,
+  data: Data,
+) -> state_machine.Step(AlertState, Data, Message, reply) {
+  case state {
+    Clear ->
+      case data.soak_milliseconds {
+        0 -> {
+          fire(data)
+          state_machine.next_state(Firing, data, [])
+        }
+        milliseconds ->
+          // The timeout's transition is driven by the current state in
+          // `handle_state_timeout`, not by this payload, so `Breach` here is
+          // an inert filler (a state timeout never arrives as a `Cast`).
+          state_machine.next_state(Pending, data, [
+            state_machine.StateTimeout(
+              state_machine.After(milliseconds),
+              Breach,
+            ),
+          ])
+      }
+    Pending -> state_machine.keep_state(data, [])
+    Firing -> state_machine.keep_state(data, [])
+    Cooling -> {
+      fire(data)
+      state_machine.next_state(Firing, data, [])
+    }
+  }
+}
+
+fn handle_recover(
+  state: AlertState,
+  data: Data,
+) -> state_machine.Step(AlertState, Data, Message, reply) {
+  case state {
+    Clear -> state_machine.keep_state(data, [])
+    Pending -> state_machine.next_state(Clear, data, [])
+    Firing ->
+      // `Breach` is inert filler here; see `handle_breach` for the rationale.
+      state_machine.next_state(Cooling, data, [
+        state_machine.StateTimeout(
+          state_machine.After(data.cool_milliseconds),
+          Breach,
+        ),
+      ])
+    Cooling -> state_machine.keep_state(data, [])
+  }
+}
+
+/// Fold a windowed sample into the bounded window, then drive the same
+/// soak/cool transitions as a per-tick rule using the aggregate verdict.
+/// Inert when no window is configured (a windowed signal to a per-tick rule).
+fn handle_sample(
+  state: AlertState,
+  data: Data,
+  value: Float,
+) -> state_machine.Step(AlertState, Data, Message, reply) {
+  case data.window {
+    None -> state_machine.keep_state(data, [])
+    Some(spec) -> {
+      let now = clock.now_ms()
+      let samples =
+        alert.prune_samples(
+          [#(now, value), ..data.samples],
+          now,
+          spec.window_ms,
+        )
+      let data = Data(..data, samples: samples)
+      case alert.window_breached(samples, now, spec) {
+        True -> handle_breach(state, data)
+        False -> handle_recover(state, data)
+      }
+    }
+  }
+}
+
+fn handle_state_timeout(
+  state: AlertState,
+  data: Data,
+) -> state_machine.Step(AlertState, Data, Message, reply) {
+  case state {
+    Clear -> state_machine.keep_state(data, [])
+    Pending -> {
+      fire(data)
+      state_machine.next_state(Firing, data, [])
+    }
+    Firing -> state_machine.keep_state(data, [])
+    Cooling -> {
+      event_bus.notify(data.bus, AlertResolved(id: data.id))
+      state_machine.next_state(Clear, data, [])
+    }
+  }
+}
+
+fn fire(data: Data) -> Nil {
+  event_bus.notify(
+    data.bus,
+    AlertFiring(
+      id: data.id,
+      level: data.level,
+      diagnostic: collect_diagnostic(),
+    ),
+  )
+}
+
+@external(erlang, "pharos_ffi", "collect_diagnostic")
+fn collect_diagnostic() -> String
