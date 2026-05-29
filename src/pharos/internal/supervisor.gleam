@@ -22,18 +22,19 @@ import gleam/list
 import gleam/otp/actor
 import gleam/otp/static_supervisor as supervisor
 import gleam/otp/supervision.{type ChildSpecification}
-import pharos/alert.{type AlertEvent, AlertData}
+import pharos/alert.{type AlertData, type AlertEvent}
 import pharos/alert_manager.{type AlertManager, type Message}
-import pharos/config.{type Config, type Threshold}
+import pharos/config.{type Config}
 import pharos/event_bus.{type EventBus}
 import pharos/internal/poller
 
-/// One row in the alert-manager spec table. The supervisor uses
-/// `threshold` to build the per-threshold `AlertData`, `name` to register
-/// the state machine deterministically, and the implicit ordering of the
-/// list to fix the static_supervisor child id.
+/// One row in the alert-manager spec table. Carries the fully-resolved
+/// `AlertData` (built by the caller from either a BEAM `Threshold` or a
+/// `ProbeThreshold`) plus the `name` to register the state machine
+/// deterministically. The implicit ordering of the list fixes the
+/// static_supervisor child id, so both lanes share one uniform table.
 pub type AlertManagerSpec {
-  AlertManagerSpec(threshold: Threshold, name: Name(Message))
+  AlertManagerSpec(data: AlertData, name: Name(Message))
 }
 
 // ---------------------------------------------------------------------------
@@ -47,7 +48,7 @@ pub fn start_link(
 ) -> Result(actor.Started(supervisor.Supervisor), actor.StartError) {
   supervisor.new(supervisor.RestForOne)
   |> supervisor.add(event_bus_child(bus_name))
-  |> supervisor.add(alert_supervisor_child(config, bus_name, manager_specs))
+  |> supervisor.add(alert_supervisor_child(bus_name, manager_specs))
   |> supervisor.add(poller_supervisor_child(config))
   |> supervisor.start
 }
@@ -67,7 +68,6 @@ fn event_bus_child(bus_name: Name(AlertEvent)) -> ChildSpecification(EventBus) {
 }
 
 fn alert_supervisor_child(
-  config: Config,
   bus_name: Name(AlertEvent),
   manager_specs: List(AlertManagerSpec),
 ) -> ChildSpecification(supervisor.Supervisor) {
@@ -77,29 +77,18 @@ fn alert_supervisor_child(
       manager_specs,
       supervisor.new(supervisor.OneForOne),
       fn(builder, spec) {
-        let AlertManagerSpec(threshold:, name:) = spec
-        supervisor.add(
-          builder,
-          alert_manager_child(config, threshold, bus, name),
-        )
+        let AlertManagerSpec(data:, name:) = spec
+        supervisor.add(builder, alert_manager_child(data, bus, name))
       },
     )
   supervisor.supervised(inner)
 }
 
 fn alert_manager_child(
-  config: Config,
-  threshold: Threshold,
+  data: AlertData,
   bus: EventBus,
   name: Name(Message),
 ) -> ChildSpecification(AlertManager) {
-  let data =
-    AlertData(
-      id: config.threshold_id(threshold),
-      level: config.default_alert_level,
-      soak_period_ms: config.soak_period_ms,
-      cool_period_ms: config.cool_period_ms,
-    )
   supervision.worker(fn() {
     case alert_manager.start_link(data, bus, name) {
       Ok(handle) ->
@@ -119,12 +108,15 @@ fn alert_manager_child(
 fn poller_supervisor_child(
   config: Config,
 ) -> ChildSpecification(supervisor.Supervisor) {
-  let inner =
-    list.fold(
+  let specs =
+    list.append(
       poller.child_specs(config.statistics),
-      supervisor.new(supervisor.OneForOne),
-      fn(builder, spec) { supervisor.add(builder, spec) },
+      poller.probe_child_specs(config.custom_statistics),
     )
+  let inner =
+    list.fold(specs, supervisor.new(supervisor.OneForOne), fn(builder, spec) {
+      supervisor.add(builder, spec)
+    })
   supervisor.supervised(inner)
 }
 
@@ -144,5 +136,6 @@ fn state_machine_error_to_string(error: state_machine.StartError) -> String {
     state_machine.InitTimeout -> "alert manager init timeout"
     state_machine.InitFailed(reason) -> reason
     state_machine.InitExited(_) -> "alert manager init exited"
+    state_machine.AlreadyStarted(_) -> "alert manager name already registered"
   }
 }

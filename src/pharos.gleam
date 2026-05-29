@@ -30,12 +30,13 @@ import gleam/erlang/atom.{type Atom}
 import gleam/erlang/process.{type Pid}
 import gleam/list
 import gleam/otp/actor
-import pharos/alert.{type AlertEvent}
+import pharos/alert.{type AlertEvent, AlertData}
 import pharos/alert_manager
 import pharos/config.{type Config}
 import pharos/event_bus.{type EventBus, type HandlerId}
 import pharos/internal/supervisor as pharos_supervisor
 import pharos/internal/telemetry
+import pharos/probe
 
 /// Opaque handle returned by `start_link`. Pass it to `subscribe`,
 /// `unsubscribe`, and `stop`.
@@ -61,14 +62,47 @@ pub type StartError {
 /// `breach`/`recover` casts to the matching alert managers.
 pub fn start_link(config: Config) -> Result(actor.Started(Pharos), StartError) {
   let bus_name = process.new_name(prefix: "pharos_event_bus")
-  let manager_specs =
+
+  // BEAM threshold lane: pair each threshold with its registered name.
+  let beam_lane =
     list.map(config.thresholds, fn(threshold) {
       let id = config.threshold_id(threshold)
-      pharos_supervisor.AlertManagerSpec(
-        threshold: threshold,
-        name: process.new_name(prefix: "pharos_alert_" <> id),
-      )
+      #(threshold, process.new_name(prefix: "pharos_alert_" <> id))
     })
+  // Custom probe threshold lane: same shape, distinct name prefix.
+  let probe_lane =
+    list.map(config.custom_thresholds, fn(threshold) {
+      let id = probe.threshold_id(threshold)
+      #(threshold, process.new_name(prefix: "pharos_probe_" <> id))
+    })
+
+  let manager_specs =
+    list.append(
+      list.map(beam_lane, fn(pair) {
+        let #(threshold, name) = pair
+        pharos_supervisor.AlertManagerSpec(
+          data: AlertData(
+            id: config.threshold_id(threshold),
+            level: config.default_alert_level,
+            soak_period_ms: config.soak_period_ms,
+            cool_period_ms: config.cool_period_ms,
+          ),
+          name: name,
+        )
+      }),
+      list.map(probe_lane, fn(pair) {
+        let #(threshold, name) = pair
+        pharos_supervisor.AlertManagerSpec(
+          data: AlertData(
+            id: probe.threshold_id(threshold),
+            level: threshold.level,
+            soak_period_ms: config.soak_period_ms,
+            cool_period_ms: config.cool_period_ms,
+          ),
+          name: name,
+        )
+      }),
+    )
 
   case pharos_supervisor.start_link(config, bus_name, manager_specs) {
     Error(error) -> Error(SupervisorStartFailed(format_actor_error(error)))
@@ -77,12 +111,25 @@ pub fn start_link(config: Config) -> Result(actor.Started(Pharos), StartError) {
       let handler_id = atom.create("pharos_handler")
 
       let manager_handles =
-        list.map(manager_specs, fn(spec) {
-          let pharos_supervisor.AlertManagerSpec(threshold:, name:) = spec
+        list.map(beam_lane, fn(pair) {
+          let #(threshold, name) = pair
+          #(threshold, alert_manager.from_name(name))
+        })
+      let probe_handles =
+        list.map(probe_lane, fn(pair) {
+          let #(threshold, name) = pair
           #(threshold, alert_manager.from_name(name))
         })
 
-      case telemetry.attach(config, manager_handles, handler_id) {
+      case
+        telemetry.attach(
+          config,
+          manager_handles,
+          probe_handles,
+          config.custom_statistics,
+          handler_id,
+        )
+      {
         Ok(Nil) ->
           Ok(actor.Started(
             pid: started.pid,
@@ -108,7 +155,7 @@ pub fn start_link(config: Config) -> Result(actor.Started(Pharos), StartError) {
 pub fn subscribe(
   pharos: Pharos,
   on_event: fn(AlertEvent) -> Nil,
-) -> Result(HandlerId, event_manager.AddError) {
+) -> Result(HandlerId, event_manager.AddError(Nil, Nil)) {
   event_bus.add_handler(pharos.bus, on_event)
 }
 
@@ -116,7 +163,7 @@ pub fn subscribe(
 pub fn unsubscribe(
   pharos: Pharos,
   handler: HandlerId,
-) -> Result(Nil, event_manager.RemoveError) {
+) -> Result(Nil, event_manager.RemoveError(Nil, Nil)) {
   event_bus.remove_handler(pharos.bus, handler)
 }
 

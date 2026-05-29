@@ -6,6 +6,7 @@
 //// exhaustively, so adding a new measurement kind surfaces as a
 //// compiler warning here.
 
+import gleam/dict
 import pharos/config.{
   type Threshold, AtomCount, BinaryMemory, CpuRunQueue, EtsMemory,
   PersistentTermCount, PersistentTermMemory, PortCount, ProcessCount,
@@ -17,6 +18,7 @@ import pharos/measurement.{
   BeamRunQueues, BeamSystemCounts, ClusterNodes, HostDisk, HostMemory,
   ProcessInfo,
 }
+import pharos/probe.{type MetricSample, type ProbeThreshold, Above, Below}
 
 /// Three-way verdict for a (measurement, threshold) pair.
 pub type Verdict {
@@ -27,6 +29,24 @@ pub type Verdict {
   Healthy
   /// The threshold applies and is currently breached.
   Breached
+}
+
+/// Evaluate a probe `threshold` against a decoded probe `sample`, returning
+/// the same `Verdict` as `evaluate/2`. A `NotApplicable` verdict means the
+/// threshold's field is absent from this sample, so the caller should neither
+/// breach nor recover.
+pub fn evaluate_probe(
+  sample: MetricSample,
+  threshold: ProbeThreshold,
+) -> Verdict {
+  case dict.get(sample, threshold.field) {
+    Error(Nil) -> NotApplicable
+    Ok(value) ->
+      case threshold.comparison {
+        Above(limit) -> verdict(value >. limit)
+        Below(limit) -> verdict(value <. limit)
+      }
+  }
 }
 
 /// Evaluate `threshold` against `measurement` and return a `Verdict`.

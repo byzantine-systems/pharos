@@ -69,9 +69,9 @@ pub fn start_link(
 
   let result =
     state_machine.new(initial_state: Clear, initial_data: initial)
-    |> state_machine.named(name)
+    |> state_machine.named(state_machine.Local(name))
     |> state_machine.on_event(handle_event)
-    |> state_machine.start
+    |> state_machine.start_link
 
   case result {
     Ok(_started) -> Ok(AlertManager(name: name))
@@ -81,12 +81,17 @@ pub fn start_link(
 
 /// Signal that the threshold has been breached.
 pub fn breach(manager: AlertManager) -> Nil {
-  state_machine.cast(process.named_subject(manager.name), Breach)
+  state_machine.cast(server_ref(manager), Breach)
 }
 
 /// Signal that the threshold is no longer breached.
 pub fn recover(manager: AlertManager) -> Nil {
-  state_machine.cast(process.named_subject(manager.name), Recover)
+  state_machine.cast(server_ref(manager), Recover)
+}
+
+/// Resolve a manager's registered name to a `ServerRef` for casting.
+fn server_ref(manager: AlertManager) -> state_machine.ServerRef(Message) {
+  state_machine.ref_from_subject(process.named_subject(manager.name))
 }
 
 fn handle_event(
@@ -97,9 +102,13 @@ fn handle_event(
   case event {
     state_machine.Cast(Breach) -> handle_breach(state, data)
     state_machine.Cast(Recover) -> handle_recover(state, data)
-    state_machine.Timeout(state_machine.StateTimeoutType) ->
+    state_machine.Timeout(state_machine.StateTimeoutType, _) ->
       handle_state_timeout(state, data)
-    state_machine.Timeout(state_machine.GenericTimeoutType(_)) ->
+    // We only ever arm state timeouts; the other timer classes are listed
+    // explicitly so a new `TimeoutType` variant surfaces here as a warning.
+    state_machine.Timeout(state_machine.EventTimeoutType, _) ->
+      state_machine.keep_state(data, [])
+    state_machine.Timeout(state_machine.GenericTimeoutType(_), _) ->
       state_machine.keep_state(data, [])
     state_machine.Info(_) -> state_machine.keep_state(data, [])
     state_machine.Call(_, _) -> state_machine.keep_state(data, [])
@@ -119,8 +128,14 @@ fn handle_breach(
           state_machine.next_state(Firing, data, [])
         }
         milliseconds ->
+          // The timeout's transition is driven by the current state in
+          // `handle_state_timeout`, not by this payload, so `Breach` here is
+          // an inert filler (a state timeout never arrives as a `Cast`).
           state_machine.next_state(Pending, data, [
-            state_machine.StateTimeout(milliseconds),
+            state_machine.StateTimeout(
+              state_machine.After(milliseconds),
+              Breach,
+            ),
           ])
       }
     Pending -> state_machine.keep_state(data, [])
@@ -140,8 +155,12 @@ fn handle_recover(
     Clear -> state_machine.keep_state(data, [])
     Pending -> state_machine.next_state(Clear, data, [])
     Firing ->
+      // `Breach` is inert filler here; see `handle_breach` for the rationale.
       state_machine.next_state(Cooling, data, [
-        state_machine.StateTimeout(data.cool_milliseconds),
+        state_machine.StateTimeout(
+          state_machine.After(data.cool_milliseconds),
+          Breach,
+        ),
       ])
     Cooling -> state_machine.keep_state(data, [])
   }

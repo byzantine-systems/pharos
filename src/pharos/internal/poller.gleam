@@ -19,6 +19,7 @@ import gleam/erlang/process.{type Pid}
 import gleam/list
 import gleam/otp/actor
 import gleam/otp/supervision.{type ChildSpecification}
+import pharos/probe.{type Probe}
 import pharos/statistic.{
   type Statistic, type StatisticKind, BeamMemory, BeamPersistentTerm,
   BeamRunQueues, BeamSystemCounts, ClusterNodes, HostDisk, HostMemory,
@@ -69,17 +70,35 @@ pub fn child_specs(statistics: List(Statistic)) -> List(ChildSpecification(Pid))
   bucket_by_interval(statistics)
   |> list.map(fn(bucket) {
     let #(interval_ms, kinds) = bucket
-    let measurements = list.map(kinds, lower_kind)
-    supervision.worker(fn() {
-      let options = [Period(interval_ms), Measurements(measurements)]
-      case start_poller(options) {
-        Ok(pid) -> Ok(actor.Started(pid: pid, data: pid))
-        Error(PollerIgnored) ->
-          Error(actor.InitFailed("telemetry_poller ignored startup"))
-        Error(PollerStartFailed(reason: reason)) ->
-          Error(actor.InitFailed(reason))
-      }
-    })
+    poller_child(interval_ms, list.map(kinds, lower_kind))
+  })
+}
+
+/// Group `probes` by polling interval and return one supervised poller child
+/// per distinct interval. Each probe lowers to a `Custom` MFA measurement;
+/// the emitter calls `telemetry:execute/3` itself. Returns an empty list when
+/// `probes` is empty.
+pub fn probe_child_specs(probes: List(Probe)) -> List(ChildSpecification(Pid)) {
+  bucket_probes_by_interval(probes)
+  |> list.map(fn(bucket) {
+    let #(interval_ms, measurements) = bucket
+    poller_child(interval_ms, measurements)
+  })
+}
+
+fn poller_child(
+  interval_ms: Int,
+  measurements: List(PollerMeasurement),
+) -> ChildSpecification(Pid) {
+  supervision.worker(fn() {
+    let options = [Period(interval_ms), Measurements(measurements)]
+    case start_poller(options) {
+      Ok(pid) -> Ok(actor.Started(pid: pid, data: pid))
+      Error(PollerIgnored) ->
+        Error(actor.InitFailed("telemetry_poller ignored startup"))
+      Error(PollerStartFailed(reason: reason)) ->
+        Error(actor.InitFailed(reason))
+    }
   })
 }
 
@@ -102,9 +121,31 @@ fn bucket_by_interval(
   dict.to_list(grouped)
 }
 
+fn bucket_probes_by_interval(
+  probes: List(Probe),
+) -> List(#(Int, List(PollerMeasurement))) {
+  let grouped =
+    list.fold(probes, dict.new(), fn(acc, definition) {
+      let interval_ms = probe.interval_ms(definition)
+      let existing = case dict.get(acc, interval_ms) {
+        Ok(measurements) -> measurements
+        Error(Nil) -> []
+      }
+      dict.insert(acc, interval_ms, [lower_probe(definition), ..existing])
+    })
+  dict.to_list(grouped)
+}
+
 // ---------------------------------------------------------------------------
 // Lowering Statistic kinds to telemetry_poller measurements
 // ---------------------------------------------------------------------------
+
+fn lower_probe(definition: Probe) -> PollerMeasurement {
+  case probe.source(definition) {
+    probe.CustomMfa(module:, function:, args:) ->
+      Custom(module: module, function: function, args: args)
+  }
+}
 
 fn lower_kind(kind: StatisticKind) -> PollerMeasurement {
   case kind {

@@ -15,7 +15,7 @@ gleam_erlang = ">= 0.25.0 and < 2.0.0"
 logging = ">= 1.0.0 and < 2.0.0"
 telemetry = ">= 1.0.0 and < 2.0.0"
 telemetry_poller = ">= 1.0.0 and < 2.0.0"
-eparch = ">= 0.6.0 and < 1.0.0"
+eparch = ">= 1.0.0 and < 2.0.0"
 gleam_otp = ">= 1.0.0 and < 2.0.0"
 
 [dev_dependencies]

@@ -16,6 +16,7 @@ import eparch/event_manager.{
   type StartError,
 }
 import gleam/erlang/process.{type Name, type Pid}
+import gleam/result
 import pharos/alert.{type AlertEvent}
 
 /// Restart-resilient handle to a running alert event bus.
@@ -24,9 +25,11 @@ pub opaque type EventBus {
 }
 
 /// Opaque reference to a registered handler. Returned by `add_handler/2`;
-/// pass to `remove_handler/2` to unsubscribe.
+/// pass to `remove_handler/2` to unsubscribe. The bus only registers
+/// fire-and-forget handlers, so the `request`/`reply` type parameters are
+/// both `Nil`.
 pub opaque type HandlerId {
-  HandlerId(ref: HandlerRef)
+  HandlerId(ref: HandlerRef(Nil, Nil))
 }
 
 /// Wrap a registered name as an `EventBus`. The name must already (or
@@ -46,14 +49,11 @@ pub fn start_link(
 ) -> Result(#(Pid, EventBus), StartError) {
   let options =
     event_manager.new_start_options()
-    |> event_manager.with_name(name)
-  case event_manager.start_monitor(options) {
-    Ok(monitored) -> {
-      let pid = event_manager.manager_pid(monitored.manager)
-      Ok(#(pid, EventBus(name: name)))
-    }
-    Error(error) -> Error(error)
-  }
+    |> event_manager.with_name(event_manager.Local(name))
+  event_manager.start_link(options)
+  |> result.map(fn(manager) {
+    #(event_manager.manager_pid(manager), EventBus(name: name))
+  })
 }
 
 /// Broadcast `event` to every registered handler. Non-blocking.
@@ -65,20 +65,21 @@ pub fn notify(bus: EventBus, event: AlertEvent) -> Nil {
 pub fn add_handler(
   bus: EventBus,
   handler: fn(AlertEvent) -> Nil,
-) -> Result(HandlerId, AddError) {
+) -> Result(HandlerId, AddError(Nil, Nil)) {
   let handler_spec =
-    event_manager.new_handler(initial_state: Nil, on_event: fn(event, _state) {
+    event_manager.new_handler(Nil, fn(event, _state) {
       handler(event)
       event_manager.Continue(Nil)
     })
-  case event_manager.add_handler(manager_for(bus), handler_spec) {
-    Ok(ref) -> Ok(HandlerId(ref))
-    Error(error) -> Error(error)
-  }
+  event_manager.add_handler(manager_for(bus), handler_spec)
+  |> result.map(HandlerId)
 }
 
 /// Unregister a previously added handler.
-pub fn remove_handler(bus: EventBus, id: HandlerId) -> Result(Nil, RemoveError) {
+pub fn remove_handler(
+  bus: EventBus,
+  id: HandlerId,
+) -> Result(Nil, RemoveError(Nil, Nil)) {
   event_manager.remove_handler(manager_for(bus), id.ref)
 }
 

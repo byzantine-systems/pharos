@@ -7,6 +7,7 @@
 import logging.{type LogLevel}
 import pharos/alert.{type AlertLevel, Warning}
 import pharos/measurement.{type MemoryUnit, Mb}
+import pharos/probe.{type Probe, type ProbeThreshold}
 import pharos/statistic.{type Statistic}
 
 // ---------------------------------------------------------------------------
@@ -64,6 +65,11 @@ pub type Config {
     /// Thresholds to evaluate on every matching measurement tick.
     /// An empty list means "observe only, never alert".
     thresholds: List(Threshold),
+    /// Custom probes to poll alongside the built-in statistics. The pluggable
+    /// lane for signals pharos has no built-in `StatisticKind` for.
+    custom_statistics: List(Probe),
+    /// Thresholds evaluated against custom probe samples.
+    custom_thresholds: List(ProbeThreshold),
     /// Where to route firing/resolved alert events.
     alert_sinks: List(AlertSink),
     /// Unit for all memory threshold comparisons and decoded measurements.
@@ -85,6 +91,8 @@ pub fn new() -> Config {
   Config(
     statistics: [],
     thresholds: [],
+    custom_statistics: [],
+    custom_thresholds: [],
     alert_sinks: [Log(level: logging.Warning)],
     memory_unit: Mb,
     soak_period_ms: 30_000,
@@ -101,6 +109,19 @@ pub fn with_statistics(config: Config, statistics: List(Statistic)) -> Config {
 /// Set the thresholds to evaluate. Replaces any previously configured list.
 pub fn with_thresholds(config: Config, thresholds: List(Threshold)) -> Config {
   Config(..config, thresholds: thresholds)
+}
+
+/// Set the custom probes to poll. Replaces any previously configured list.
+pub fn with_custom_statistics(config: Config, probes: List(Probe)) -> Config {
+  Config(..config, custom_statistics: probes)
+}
+
+/// Set the custom probe thresholds. Replaces any previously configured list.
+pub fn with_custom_thresholds(
+  config: Config,
+  thresholds: List(ProbeThreshold),
+) -> Config {
+  Config(..config, custom_thresholds: thresholds)
 }
 
 /// Set the alert sinks. Replaces any previously configured list.
